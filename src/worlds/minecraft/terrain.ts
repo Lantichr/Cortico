@@ -9,7 +9,7 @@
 import { Vec3 } from 'vec3';
 import { nowIso } from '../../core/util.ts';
 import {
-  type Durability, type ItemEnchant, type ItemLike, readDurability, readEnchants,
+  type Durability, type ItemEnchant, type ItemLike, readDurability, readEnchants, readPotionName,
 } from './item-facts.ts';
 import {
   roman, VILLAGER_PROFESSION_ZH, zhBiome, zhDimension, zhEffect, zhEnchant, zhEntity, zhName,
@@ -92,6 +92,8 @@ export interface ItemStack {
   count: number;
   /** 这一摞身上的附魔;没附魔的物品不填。附魔件不可堆叠,每件占一格 */
   enchantments?: ItemEnchant[];
+  /** 药水、喷溅药水、滞留药水、药箭装的是什么(readPotionName);别的物品不填 */
+  potion?: string;
 }
 
 /** 装备槽。手上那件走 `heldItem`,这里只收穿在身上的与副手 */
@@ -643,7 +645,7 @@ export function narrateInventory(items: ItemStack[]): string {
 function mergedStacks(items: ItemStack[]): Map<string, { count: number; label: string }> {
   const merged = new Map<string, { count: number; label: string }>();
   for (const it of items) {
-    const suffix = enchantSuffix(it.enchantments);
+    const suffix = enchantSuffix(it.enchantments) + (it.potion ? `（${it.potion}）` : '');
     const key = `${it.name}${suffix}`;
     const cur = merged.get(key);
     if (cur) cur.count += it.count;
@@ -1149,6 +1151,26 @@ export function findBankCell(
     if (best) return best;
   }
   return null;
+}
+
+/**
+ * 一步做完人还泡在水里时补在回执末尾的一句:脚下水多深、最近能站的干地在哪。
+ * 不在水里、或者坐着船,返回空串。
+ */
+export function wetNote(bot: any): string {
+  // 物理引擎的 isInWater 在水面上逐刻翻,不能拿它判;直接读脚和头那两格
+  const cell = (dy: number) => bot.blockAt?.(bot.entity.position.offset(0, dy, 0));
+  if (bot.vehicle || ![cell(0), cell(1)].some((b) => b != null && WATER_BLOCKS.has(b.name))) return '';
+  const base = bot.entity.position.floored();
+  let depth = 0;
+  while (depth < 32) {
+    const b = bot.blockAt(new Vec3(base.x, base.y - depth, base.z));
+    if (!b || !WATER_BLOCKS.has(b.name)) break;
+    depth++;
+  }
+  const bank = findBankCell(bot, null, 16);
+  return `。人现在泡在水里(脚下水深 ${depth} 格,`
+    + (bank ? `最近能站的干地 (${bank.x}, ${bank.y}, ${bank.z}))` : '16 格内没有能站的岸)');
 }
 
 /** 碰上就烧人的方块:碰撞箱压上去即掉血(combat 的 standable 与这里共用一份口径) */
@@ -1714,7 +1736,11 @@ export function snapshotFromBot(
     heldItem: bot.heldItem ? bot.heldItem.name : null,
     inventory: (bot.inventory?.items() ?? []).map((it: any) => {
       const ench = readEnchants(it, bot.registry);
-      return { name: it.name, count: it.count, ...(ench.length > 0 ? { enchantments: ench } : {}) };
+      const potion = readPotionName(it);
+      return {
+        name: it.name, count: it.count,
+        ...(ench.length > 0 ? { enchantments: ench } : {}), ...(potion ? { potion } : {}),
+      };
     }),
     xpLevel: bot.experience?.level ?? 0,
     equipment: readEquipment(bot),

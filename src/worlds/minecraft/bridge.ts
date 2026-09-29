@@ -18,6 +18,9 @@ import {
 import { isGravityBlock, isSpawnAnchorBlock } from './policy.ts';
 import type { ShowTempo } from './show.ts';
 import { pocketScan, standCellsAround } from './terrain.ts';
+import { trackWindowProps } from './containers.ts';
+import { installTreadWater } from './travel.ts';
+import { trackMaps } from './map-view.ts';
 
 interface BridgeOptions {
   host: string;
@@ -324,6 +327,8 @@ export class Bridge {
     }
     this._bot = bot;
     this._invSynced = false;
+    // 包里地图的整张画面服务端只在登录后第一刻推一次,早于 spawn;挂在 spawn 上就只剩增量
+    trackMaps(bot);
     /** 修补须通过插件注入，等待 Mineflayer 的 inject_allowed。 */
     bot.loadPlugin((b) => installMineflayerFixes(b, log, this.opts.diag, this.opts.showTempo));
     bot.loadPlugin(pathfinder);
@@ -401,6 +406,8 @@ export class Bridge {
     bot.pathfinder.setMovements(movements);
     bot.pathfinder.tickTimeout = 60;
     suppressSprintNearWater(bot, movements);
+    installTreadWater(bot);
+    trackWindowProps(bot);
     this.installDigBackoff(bot);
     this.installPathDiag(bot);
     this.startViewer(bot, gen);
@@ -410,8 +417,17 @@ export class Bridge {
   private applyTuning(bot: mineflayer.Bot, movements: Movements): void {
     const log = this.opts.log;
 
-    /** 寻路单次落差限制为一格。 */
+    /** 寻路单次落差上限 2 格(原版 3 格内摔落不掉血)。 */
     movements.maxDropDown = 2;
+
+    /**
+     * 水路代价:游一步记 1 + 3,往水里跳也受 maxDropDown 约束(上游默认不限高)。
+     * 在存档 33 西海台周边取直播里真实下过的 107 对起终点只算不走:成功路线上泡水的路点
+     * 139 → 99,没有新增算不出的路,多垫 44 块方块;液体代价取 5 与 3 的结果逐条相同。
+     */
+    // 上游类型声明漏了 liquidCost,运行时字段在 Movements 上
+    (movements as unknown as { liquidCost: number }).liquidCost = 3;
+    movements.infiniteLiquidDropdownDistance = false;
 
     /** 上游 lava 的 diggable=true；额外加入 blocksCantBreak 禁止寻路挖掘。 */
     const lava = (bot.registry.blocksByName as Record<string, { id: number } | undefined>).lava;

@@ -21,15 +21,16 @@ import { dropGoal, gotoGoal } from './travel.ts';
 import { type SkillCall } from './skills.ts';
 import { pickMissText, pickTargetOf, pickedText, type PickTarget } from './item-pick.ts';
 import {
-  containerStacks, findContainers, furnaceDoneAt, noContainerNearby, openNearbyContainer,
-  openWindowGuarded, orderForStow, orderForTake, rememberChest, slotStack, smeltPerItemMs,
-  type GenericWindow,
+  BREW_BOTTLE_SLOTS, BREW_FUEL_SLOT, BREW_INPUT_SLOT, BREW_PROP_FUEL, BREW_PROP_TIME, WINDOW_SETTLE_MS,
+  brewStandText, containerStacks, findContainers, furnaceDoneAt, noContainerNearby, openNearbyContainer,
+  openWindowGuarded, orderForStow, orderForTake, potionText, rememberChest, slotStack, smeltPerItemMs,
+  windowProp, type GenericWindow,
 } from './containers.ts';
 import { contentsText, zhErrorText } from './receipt.ts';
 import { ShowPacer } from './show.ts';
 import { type Anchor, type Cell } from './geometry.ts';
 import { FURNACE_STATION, ensureStation, type Station, type StationAt } from './placement.ts';
-import { readEnchants, readPotionId, type ItemEnchant } from './item-facts.ts';
+import { readEnchants, type ItemEnchant } from './item-facts.ts';
 import { normalizeDimension } from './escape.ts';
 
 const { goals } = pathfinderPkg;
@@ -1092,11 +1093,6 @@ export async function skillEnchant(
 
 // ── 酿造台 ────────────────────────────────────────────────────────────────────
 
-/** 酿造台的窗口槽位(原版固定):0-2 三个瓶位,3 材料位,4 燃料位 */
-export const BREW_BOTTLE_SLOTS = [0, 1, 2] as const;
-export const BREW_INPUT_SLOT = 3;
-export const BREW_FUEL_SLOT = 4;
-
 /** 原版一轮酿造 400 刻 = 20 秒,与瓶数无关 */
 export const BREW_ROUND_MS = 20_000;
 
@@ -1104,21 +1100,19 @@ export const BREW_STATION: Station = {
   kinds: ['brewing_stand'], label: '酿造台', hint: '先 craft 一个酿造台(1 根烈焰棒 + 3 块圆石)',
 };
 
-/** 一件药水念成「药水(内容 #N)」;`#N` 是原版药水注册表序号,不是药水都不带这个尾巴 */
-export function potionText(stack: { name: string; count: number } | null): string {
-  if (!stack) return '空';
-  const id = readPotionId(stack as never);
-  return `${zhName(stack.name)}${id === null ? '' : `(内容 #${id})`}×${stack.count}`;
-}
-
-/** 三个瓶位现在各是什么;同内容的合并计数 */
-export function bottleText(win: GenericWindow, loaded: number): string {
-  if (loaded === 0) return '空';
-  const bits = BREW_BOTTLE_SLOTS
-    .map((s) => win.slots[s] ?? null)
-    .filter((s): s is { name: string; count: number; slot: number } => s !== null)
-    .map((s) => potionText(s));
-  return bits.length > 0 ? bits.join('、') : `${loaded} 瓶`;
+/** 酿造台开窗:mineflayer 的 openContainer 只认箱子族,酿造台走 openBlock */
+async function openBrewingStand(
+  bot: Bot, ctx: SkillContext, block: NonNullable<ReturnType<Bot['blockAt']>>,
+): Promise<GenericWindow> {
+  const win = await openWindowGuarded(
+    bot, ctx,
+    () => (bot as unknown as { openBlock(b: unknown): Promise<GenericWindow> }).openBlock(block),
+  );
+  if (win.type !== undefined && !win.type.startsWith('minecraft:brewing_stand')) {
+    win.close();
+    throw new SkillBlocked(`开出来的窗口是 ${win.type},不是酿造台`);
+  }
+  return win;
 }
 
 /**
@@ -1159,25 +1153,33 @@ export async function skillBrew(
   await show.openGap();
   let win: GenericWindow;
   try {
-    win = await openWindowGuarded(bot, ctx, () => bot.openContainer(at.block) as unknown as Promise<GenericWindow>);
+    win = await openBrewingStand(bot, ctx, at.block);
   } catch (err) {
     if (err instanceof Aborted || err instanceof SkillBlocked) throw err;
     throw new SkillBlocked(`${at.note};打不开${where}: ${zhErrorText((err as Error).message)}`);
   }
   const want = Math.min(call.count, bottleHave);
   let loaded = 0;
-  let fuelPut = 0;
+  let fuelPut = false;
+  let brewing = false;
+  let stand = '';
   try {
     await show.beat('open');
+    await sleep(WINDOW_SETTLE_MS);
     const grab = (name: string) => win.items().find((i) => i.name === name);
     const inSlot = (slot: number) => win.slots[slot] ?? null;
-    // 烧着才酿:燃料槽空了就补一份,已经有燃料就不再塞
-    if (!inSlot(BREW_FUEL_SLOT)) {
+    // 烧着才酿:台里没剩燃料轮数、燃料位也空,才补一份;原版放进去的那份会立刻烧成 20 轮
+    const fuelLeft = windowProp(bot, win, BREW_PROP_FUEL);
+    if (!inSlot(BREW_FUEL_SLOT) && !(fuelLeft !== null && fuelLeft > 0)) {
       const fuel = grab(call.fuel);
-      if (fuel) {
-        await bot.moveSlotItem(fuel.slot, BREW_FUEL_SLOT).catch(() => undefined);
-        fuelPut = inSlot(BREW_FUEL_SLOT)?.count ?? 0;
+      if (!fuel) {
+        throw new SkillBlocked(
+          `${at.note};${where}燃料 ${fuelLeft ?? '读数没收到'}/20 轮、燃料位空,包里也没有${zhName(call.fuel)}`,
+        );
       }
+      await bot.moveSlotItem(fuel.slot, BREW_FUEL_SLOT).catch(() => undefined);
+      await sleep(WINDOW_SETTLE_MS);
+      fuelPut = true;
     }
     for (const slot of BREW_BOTTLE_SLOTS.slice(0, want)) {
       if (inSlot(slot)) { loaded++; continue; }
@@ -1196,6 +1198,9 @@ export async function skillBrew(
       throw new SkillBlocked(`${at.note};${where}的材料位没放进${zhName(call.input)},台子不收它`);
     }
     if (loaded === 0) throw new SkillBlocked(`${at.note};${where}的三个瓶位一个都没放进${zhName(call.bottle)}`);
+    // 下完料等服务端下一刻开酿;酿造刻 > 0 才算点着了
+    await sleep(WINDOW_SETTLE_MS);
+    brewing = (windowProp(bot, win, BREW_PROP_TIME) ?? 0) > 0;
   } finally {
     const state = {
       input: slotStack(win, BREW_INPUT_SLOT),
@@ -1205,21 +1210,25 @@ export async function skillBrew(
     const now = Date.now();
     ctx.chests?.rememberFurnace(
       dimensionOf(bot), cell, 'brewing_stand', state, now,
-      state.input && loaded > 0 ? now + BREW_ROUND_MS : null,
+      brewing ? now + BREW_ROUND_MS : null,
     );
+    stand = brewStandText(bot, win);
     win.close();
   }
-  const fuelNote = fuelPut > 0
-    ? `燃料槽放了${zhName(call.fuel)}×${fuelPut}(一份烧 20 轮)`
-    : `燃料槽本来就有${zhName(win.slots[BREW_FUEL_SLOT]?.name ?? call.fuel)}`;
-  const etaClock = ctx.clock ? `${ctx.clock(Date.now() + BREW_ROUND_MS)} 左右` : '20 秒后';
   ctx.diag?.write({
-    lane: 'craft', event: 'brew-start', taskId: ctx.taskId,
-    msg: `${where}:${loaded} 瓶${call.bottle} + ${call.input}`,
-    data: { at: cell, bottles: loaded, input: call.input, fuel: call.fuel, fuelPut },
+    lane: 'craft', event: brewing ? 'brew-start' : 'brew-idle', taskId: ctx.taskId,
+    msg: `${where}:${loaded} 瓶${call.bottle} + ${call.input}${brewing ? '' : ',没开酿'}`,
+    data: {
+      at: cell, bottles: loaded, input: call.input, fuel: call.fuel, fuelPut,
+      fuelLeft: windowProp(bot, win, BREW_PROP_FUEL), brewTicks: windowProp(bot, win, BREW_PROP_TIME),
+    },
   });
-  return `${at.note};在${where}下了料:瓶位${bottleText(win, loaded)},材料位${zhName(call.input)},${fuelNote}。`
-    + `一轮约 20 秒(${etaClock}好,有事件提醒);这段时间不用守着。`
+  const put = `${at.note};在${where}下了料${fuelPut ? `,燃料位补了${zhName(call.fuel)}` : ''}。台里现在:${stand}。`;
+  if (!brewing) {
+    throw new SkillBlocked(`${put}台子没开酿:这一对瓶和材料按原版酿不出东西,或者燃料没点着`, [], 'server');
+  }
+  const etaClock = ctx.clock ? `${ctx.clock(Date.now() + BREW_ROUND_MS)} 左右` : '20 秒后';
+  return `${put}一轮约 20 秒(${etaClock}好,有事件提醒);这段时间不用守着。`
     + `取货:{"skill":"take","at":[${cell.x},${cell.y},${cell.z}],"all":true}`;
 }
 
@@ -1236,7 +1245,7 @@ export async function takeFromBrewingStand(
   await show.openGap();
   let win: GenericWindow;
   try {
-    win = await openWindowGuarded(bot, ctx, () => bot.openContainer(block) as unknown as Promise<GenericWindow>);
+    win = await openBrewingStand(bot, ctx, block);
   } catch (err) {
     if (err instanceof Aborted || err instanceof SkillBlocked) throw err;
     throw new SkillBlocked(`打不开 ${where}: ${zhErrorText((err as Error).message)}`);
@@ -1282,6 +1291,15 @@ export async function takeFromBrewingStand(
  * 显式穿门只认当前维度里实际读到的下界传送门方块。寻路负责到门边，最后踏进
  * 门里的动作由这一步自己完成；维度未改变前绝不把“到了门口”当成完成。
  */
+/** transit 认的三种门方块 */
+export const PORTAL_BLOCKS = new Set(['nether_portal', 'end_portal', 'end_gateway']);
+/**
+ * 折跃门:人离门方块超过这么远就算已经被传走。两端相距约千格(外岛那头生成在离主岛门约 1024 格处);
+ * 穿门前人先走到门边(GoalNear 半径 2),再一路朝门方块走,离它不会比走到门边那一刻更远。
+ * 按离门方块算:从远处走过来时,出发点离门本来就可能超过这个数。
+ */
+const GATEWAY_JUMP_BLOCKS = 64;
+
 export async function skillTransit(
   bot: Bot,
   call: Extract<SkillCall, { skill: 'transit' }>,
@@ -1290,36 +1308,52 @@ export async function skillTransit(
   const portal = resolveAt(bot, call.at);
   const block = blockAtCell(bot, portal);
   if (!block) throw new SkillBlocked(`${cellText(portal)} 所在区块没加载`);
-  if (block.name !== 'nether_portal') {
-    throw new SkillBlocked(`${cellText(portal)} 是${zhName(block.name)},不是下界传送门方块`);
+  const kind = block.name;
+  if (!PORTAL_BLOCKS.has(kind)) {
+    throw new SkillBlocked(`${cellText(portal)} 是${zhName(kind)},不是传送门方块(下界传送门、末地传送门、末地折跃门)`);
   }
 
   const fromDimension = normalizeDimension(dimensionOf(bot));
-  await gotoGoal(bot, new goals.GoalNear(portal.x, portal.y, portal.z, 1), ctx);
+  const portalCenter = new Vec3(portal.x + 0.5, portal.y + 0.5, portal.z + 0.5);
+  // 折跃门在末地内部传送,维度不变,只看人离门方块多远
+  const crossed = (): boolean => (kind === 'end_gateway'
+    ? bot.entity.position.distanceTo(portalCenter) > GATEWAY_JUMP_BLOCKS
+    : normalizeDimension(dimensionOf(bot)) !== fromDimension);
+  await gotoGoal(bot, new goals.GoalNear(portal.x, portal.y, portal.z, kind === 'nether_portal' ? 1 : 2), ctx);
   checkAbort(ctx);
   const reread = blockAtCell(bot, portal);
-  if (reread?.name !== 'nether_portal') {
-    throw new SkillBlocked(`走到门边时 ${cellText(portal)} 已经不是下界传送门了`);
+  if (reread?.name !== kind) {
+    throw new SkillBlocked(`走到门边时 ${cellText(portal)} 已经不是${zhName(kind)}了`);
   }
 
   dropGoal(bot, 'task', '到门边了,自己走进去', ctx.diag);
-  await bot.lookAt(new Vec3(portal.x + 0.5, portal.y + 0.8, portal.z + 0.5), true);
+  // 末地传送门是地面上一层,朝门中心低头走进去就掉进去;另两种是竖着的,平视
+  const aimY = kind === 'end_portal' ? portal.y + 0.2 : portal.y + 0.8;
+  await bot.lookAt(new Vec3(portal.x + 0.5, aimY, portal.z + 0.5), true);
   const deadline = Date.now() + 20_000;
+  let touched = false;
   try {
-    while (normalizeDimension(dimensionOf(bot)) === fromDimension) {
+    while (!crossed()) {
       checkAbort(ctx);
-      if (Date.now() >= deadline) {
-        throw new SkillBlocked(`已经走进 ${cellText(portal)} 的门里等了 20 秒,维度仍是${zhDimension(fromDimension)}`);
-      }
       const feet = feetOf(bot);
-      const bodyInPortal = blockAtCell(bot, feet)?.name === 'nether_portal'
-        || blockAtCell(bot, { x: feet.x, y: feet.y + 1, z: feet.z })?.name === 'nether_portal';
+      const bodyInPortal = blockAtCell(bot, feet)?.name === kind
+        || blockAtCell(bot, { x: feet.x, y: feet.y + 1, z: feet.z })?.name === kind;
+      touched ||= bodyInPortal;
+      if (Date.now() >= deadline) {
+        const stuck = `维度仍是${zhDimension(fromDimension)}`;
+        throw new SkillBlocked(touched
+          ? `人进了 ${cellText(portal)} 的${zhName(kind)},等了 20 秒${kind === 'end_gateway' ? '人还在原地附近' : stuck}`
+          : `朝 ${cellText(portal)} 的${zhName(kind)}走了 20 秒,身子一直没碰到门方块,停在 ${cellText(feet)};${stuck}`);
+      }
       bot.setControlState('forward', !bodyInPortal);
+      // 末地传送门四周的框架高 13/16 格、折跃门悬在基岩中间,平地都走不进去;没进门就一路跳
+      bot.setControlState('jump', kind !== 'nether_portal' && !bodyInPortal);
       await sleep(100);
     }
   } finally {
     bot.setControlState('forward', false);
     bot.setControlState('sprint', false);
+    bot.setControlState('jump', false);
   }
 
   const changedAt = Date.now();
