@@ -1185,7 +1185,7 @@ const SKILLS: readonly SkillSpec[] = [
       },
       { key: 'fill', kind: 'enum', values: ['solid', 'outline', 'edges'], error: 'fill 只认 solid/outline/edges', doc: '只对 box 有意义' },
       {
-        key: 'where', kind: 'names', hint: `方块英文 id 或类别 ${UNTIL_CATEGORY_DOC}`,
+        key: 'where', kind: 'names', hint: `方块英文 id 或类别 ${UNTIL_CATEGORY_DOC};实体 id 按收到的实体表报`,
         doc: '只报这几样在这片里的坐标(不看视线)',
       },
     ],
@@ -1440,7 +1440,7 @@ const SKILLS: readonly SkillSpec[] = [
   },
   {
     name: 'stow',
-    doc: `{"skill":"stow","item":"cobblestone","count":64} 存进附近箱子(32 格内)。先找上次看见还有空位的,没有就开最近没开过的
+    doc: `{"skill":"stow","item":"cobblestone","count":64} 存进附近箱子(32 格内)。先找上次看见还有空位的,没有就开最近没开过的;放不下的换下一口接着存
 {"skill":"stow","item":"enchanted_book","pick":"精准采集","count":1}
                                                  同 id 的几件里只存点名的那件(留下别的)`,
     fields: [
@@ -1451,7 +1451,7 @@ const SKILLS: readonly SkillSpec[] = [
   },
   {
     name: 'take',
-    doc: `{"skill":"take","item":"coal","count":16}        从附近箱子取出。先找账本里有的,对不上再开,最多 3 个
+    doc: `{"skill":"take","item":"coal","count":16}        从附近箱子取出,运输矿车也算。先找账本里有的,对不上再开,最多 3 个
 {"skill":"take","at":[103,63,-31],"all":true}    明确清空那一格容器:炉子=输出+没烧完的料+剩的燃料;箱子=整箱。
                                                  定量取物必须同时写 item 和 count,不默认数量`,
     parse: parseTake,

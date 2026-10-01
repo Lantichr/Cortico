@@ -275,12 +275,38 @@ describe('equip:盔甲穿身上,不是全塞主手', () => {
       getEquipmentDestSlot: (dest: string) => (dest === 'off-hand' ? 45 : 36),
       equip: async (it: { name: string }, dest: string) => {
         equips.push([it.name, dest]);
+        // 从副手拿到主手:落进快捷栏的空格,副手空出来
+        if (dest === 'hand' && slots[45] === it) slots[45] = null;
         if (dest === 'hand') bot.heldItem = it;
       },
+      unequip: async (dest: string) => { equips.push(['(unequip)', dest]); },
       pathfinder: { stop() {}, setGoal() {}, goto: async () => {} },
     };
     return bot;
   }
+
+  it('剑挂在副手、包里没有:equip 主手把它换过来,不报包里没有', async () => {
+    const sword = { name: 'diamond_sword', type: 7, count: 1 };
+    const bot = offHandBot({ bag: [], offHand: sword });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'equip', item: 'diamond_sword', hand: 'main' }]);
+    await waitUntil(() => reports.length === 1);
+    expect(reports[0].kind).toBe('done');
+    expect(bot.equips).toEqual([['diamond_sword', 'hand']]);
+    expect(bot.heldItem).toBe(sword);
+    expect(reports[0].text).toContain('把副手的钻石剑换到了主手;副手空了');
+  });
+
+  it('包 36 格全满时腾副手:不腾、不扔,受阻说明东西还挂在副手', async () => {
+    const bag = Array.from({ length: 36 }, (_, i) => ({ name: 'cobblestone', type: 100, count: 64, stackSize: 64, slot: 9 + i }));
+    const bot = offHandBot({ bag, offHand: { name: 'diamond_sword', type: 7, count: 1 } });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'equip', hand: 'off' }]);
+    await waitUntil(() => reports.length === 1);
+    expect(reports[0].kind).toBe('blocked');
+    expect(reports[0].text).toContain('没腾,它还挂在副手');
+    expect(bot.equips).toEqual([]);
+  });
 
   it('hand:"off" 把本来归主手的东西挂到副手', async () => {
     const bot = offHandBot({ bag: [{ name: 'filled_map', type: 5, count: 1 }] });
@@ -910,13 +936,15 @@ describe('smelt:下料点火就走(B1 解耦)', () => {
 });
 
 describe('Reflexes 防溺水', () => {
+  /** 触发那一句;反射接管寻路的去向与溺水结束另有报告 */
+  const alarms = (rs: TaskReport[]): TaskReport[] => rs.filter((r) => !r.text.includes('溺水自救'));
   it('旱地上的残留低氧读数不触发溺水(氧气元数据会冻在旧值)', () => {
     const bot = drownBot('air', 3);
     const { reflexes, reports } = makeReflexes(bot);
     reflexes.start();
     vi.advanceTimersByTime(6_000);
     reflexes.stop();
-    expect(reports).toHaveLength(0);
+    expect(alarms(reports)).toHaveLength(0);
     expect(bot.jumps).toHaveLength(0);
   });
 
@@ -926,8 +954,8 @@ describe('Reflexes 防溺水', () => {
     reflexes.start();
     vi.advanceTimersByTime(10_000);
     reflexes.stop();
-    expect(reports).toHaveLength(1);
-    expect(reports[0].text).toContain('氧气 3/20');
+    expect(alarms(reports)).toHaveLength(1);
+    expect(alarms(reports)[0].text).toContain('氧气 3/20');
     expect(bot.jumps).toContain(true);
   });
 
@@ -941,8 +969,8 @@ describe('Reflexes 防溺水', () => {
     handlers.entityHurt({ id: bot.entity.id });
     vi.advanceTimersByTime(300);
     reflexes.stop();
-    expect(reports).toHaveLength(1);
-    expect(reports[0].text).toContain('周围没有敌人却在掉血');
+    expect(alarms(reports)).toHaveLength(1);
+    expect(alarms(reports)[0].text).toContain('周围没有敌人却在掉血');
     expect(bot.jumps).toContain(true);
   });
 
@@ -952,8 +980,8 @@ describe('Reflexes 防溺水', () => {
     reflexes.start();
     vi.advanceTimersByTime(11_000);
     reflexes.stop();
-    expect(reports).toHaveLength(1);
-    expect(reports[0].text).not.toContain('氧气读数 20/20');
+    expect(alarms(reports)).toHaveLength(1);
+    expect(alarms(reports)[0].text).not.toContain('氧气读数 20/20');
   });
 
   it('刚下水的头两秒不看氧气:旧读数要等元数据跟上', () => {
@@ -961,7 +989,7 @@ describe('Reflexes 防溺水', () => {
     const { reflexes, reports } = makeReflexes(bot);
     reflexes.start();
     vi.advanceTimersByTime(2_000);
-    expect(reports).toHaveLength(0);
+    expect(alarms(reports)).toHaveLength(0);
     reflexes.stop();
   });
 
@@ -970,12 +998,12 @@ describe('Reflexes 防溺水', () => {
     const { reflexes, reports } = makeReflexes(bot);
     reflexes.start();
     vi.advanceTimersByTime(5_000);
-    expect(reports).toHaveLength(1);
+    expect(alarms(reports)).toHaveLength(1);
     bot.setHead('air');
     vi.advanceTimersByTime(3_000);
     reflexes.stop();
     expect(bot.jumps[bot.jumps.length - 1]).toBe(false);
-    expect(reports).toHaveLength(1);
+    expect(alarms(reports)).toHaveLength(1);
   });
 
   it('头出水不交还任务,稳定干燥落脚 600ms 后才恢复环境断点', () => {
@@ -1275,12 +1303,14 @@ describe('环境冻结的作用域是一步,不是一单', () => {
     // 自救那一步跑完了,而危机还在:第 2 步不许开工
     await sleep(400);
     expect(bot.said).toEqual([]);
-    expect(reports).toEqual([]);
+    // 冻结本身要告诉 bot:不然她排的任务只排队不开跑,她看不出为什么
+    expect(reports.map((r) => r.kind)).toEqual(['reflex']);
+    expect(reports[0].text).toContain('逃离岩浆');
     expect(exec.status().hold).toBe('逃离岩浆');
 
     // 解冻:断点放回队首,从没开工的那一步接着做
     exec.resumeAfterEnvironment(token);
-    await waitUntil(() => reports.length === 1, 5000);
+    await waitUntil(() => reports.length === 2, 5000);
     expect(bot.said).toEqual(['解冻之后才轮到我']);
   }, 15_000);
 });
@@ -2206,7 +2236,7 @@ it('collect 挖之前先把趁手的家伙拿到手上', async () => {
     componentMap?: Map<string, { data: unknown }>;
   };
 
-  function tierBot(opts: { block: string; bag: TierItem[] }) {
+  function tierBot(opts: { block: string; bag: TierItem[]; offHand?: TierItem }) {
     const ITEMS: Record<number, string> = {
       10: 'wooden_pickaxe', 11: 'stone_pickaxe', 12: 'iron_pickaxe', 13: 'diamond_pickaxe',
       14: 'golden_pickaxe', 15: 'iron_shovel', 20: 'raw_iron', 21: 'obsidian', 22: 'cobblestone', 23: 'dirt',
@@ -2235,10 +2265,15 @@ it('collect 挖之前先把趁手的家伙拿到手上', async () => {
         items: Object.fromEntries(Object.entries(ITEMS).map(([id, name]) => [id, { name }])),
         itemsByName: Object.fromEntries(Object.entries(ITEMS).map(([id, name]) => [name, { id: Number(id) }])),
       },
-      inventory: { items: () => bag },
+      // 副手是窗口槽 45,不在 items() 里;从副手拿到主手后它落进快捷栏的空格
+      inventory: { items: () => bag, slots: Object.assign([] as Array<TierItem | null>, { 45: opts.offHand ?? null }) },
       heldItem: null as TierItem | null,
       equip: async (item: TierItem) => {
         equipped.push(item.name);
+        if (bot.inventory.slots[45] === item) {
+          bot.inventory.slots[45] = null;
+          bag.push(item);
+        }
         bot.heldItem = item;
       },
       lookAt: async () => {},
@@ -2417,6 +2452,37 @@ it('collect 挖之前先把趁手的家伙拿到手上', async () => {
     expect(b.reports[0].text).toContain('本步指定的木镐挖铁矿石不掉东西');
     expect(wrong.equipped).toEqual([]);
     expect(wrong.dug).toBe(0);
+  });
+
+  /** 附魔按组件格式写;字符串 id 不经 registry 也读得出名字 */
+  const enchanted = (name: string, type: number, ench: string, level: number): TierItem => ({
+    name, type, count: 1,
+    componentMap: new Map([['enchantments', { data: { enchantments: [{ id: `minecraft:${ench}`, level }] } }]]),
+  });
+
+  it('精确 tool 同名有几把:用已经拿在主手的那把,回执念出附魔', async () => {
+    const fortune = enchanted('diamond_pickaxe', 13, 'fortune', 3);
+    const efficiency = enchanted('diamond_pickaxe', 13, 'efficiency', 5);
+    const bot = tierBot({ block: 'stone', bag: [fortune, efficiency] });
+    bot.heldItem = efficiency;
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'collect', block: 'stone', count: 1, tool: 'diamond_pickaxe' }]);
+    await waitUntil(() => reports.length === 1, 8000);
+    expect(reports[0].kind).toBe('done');
+    expect(bot.heldItem).toBe(efficiency);
+    expect(reports[0].text).toContain('本步临时指定钻石镐（效率V）');
+  });
+
+  it('镐挂在副手、包里没有:照样拿到主手挖,回执说明副手变成了什么', async () => {
+    const pick = { name: 'diamond_pickaxe', type: 13, count: 1 };
+    const bot = tierBot({ block: 'stone', bag: [], offHand: pick });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'collect', block: 'stone', count: 1 }]);
+    await waitUntil(() => reports.length === 1, 8000);
+    expect(reports[0].kind).toBe('done');
+    expect(bot.heldItem).toBe(pick);
+    expect(bot.dug).toBe(1);
+    expect(reports[0].text).toContain('钻石镐是从副手换到主手的,副手空了');
   });
 
   // 正则 `/_ore$|stone|deepslate|cobble/` 认不出黑曜石、安山岩、下界岩这一批,
@@ -3574,14 +3640,14 @@ describe('战斗挂起与恢复(suspend/resume)', () => {
     const token = exec.pauseForEnvironment('防溺水上浮找岸');
     release!();
     await sleep(50);
-    expect(reports).toEqual([]);
+    expect(reports.map((r) => r.kind)).toEqual(['reflex']);
     expect(exec.status().waiting[0]?.label).toContain('(被打断,待续)');
 
     const resumed = exec.resumeAfterEnvironment(token);
     expect(resumed.released).toBe(true);
     expect(resumed.note).toContain('任务#1');
-    await waitUntil(() => reports.length === 1, 5000);
-    expect(reports[0].kind).toBe('done');
+    await waitUntil(() => reports.length === 2, 5000);
+    expect(reports[1].kind).toBe('done');
     expect(reports.some((report) => report.kind === 'superseded')).toBe(false);
     expect(gotoCalls).toBe(2);
     expect(bot.said).toEqual(['前半', '尾巴']);
@@ -3728,8 +3794,7 @@ describe('战斗挂起与恢复(suspend/resume)', () => {
 
     // 末一槽释放才恢复断点
     expect(exec.resumeQueue(fall)).toBe(true);
-    await waitUntil(() => reports.length === 1, 5000);
-    expect(reports[0].kind).toBe('done');
+    await waitUntil(() => reports.some((r) => r.kind === 'done'), 5000);
     expect(gotoCalls).toBe(2);
     expect(bot.said).toEqual(['落地后继续']);
   });
@@ -3759,7 +3824,7 @@ describe('战斗挂起与恢复(suspend/resume)', () => {
     const out = exec.resumeAfterEnvironment(environment);
     expect(out.released).toBe(true);
     expect(out.note).toContain('任务#1');
-    await waitUntil(() => reports.length === 1, 5000);
+    await waitUntil(() => reports.some((r) => r.kind === 'done'), 5000);
     expect(bot.said).toEqual(['两槽都空才说']);
   });
 
@@ -4655,6 +4720,18 @@ describe('toss 的落点', () => {
     expect(bot.looked).toHaveLength(1);
     expect(reports[0].text).toContain('朝东抬头抛出去');
   });
+
+  it('两格高的通道:抬头抛会撞顶,改沿通道平着扔出去,不退回脚边', async () => {
+    // 脚下 y=64 与齐眼 y=65 沿 +X 是空的,y=66 是通道顶
+    const bot = tossBot((x, y, z) => !(x >= 0 && z === 0 && (y === 64 || y === 65)));
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'toss', item: 'cobblestone', count: 4 }]);
+    await waitUntil(() => reports.length === 1);
+    expect(bot.looked).toHaveLength(1);
+    expect(bot.looked[0].pitch).toBe(0);
+    expect(reports[0].text).toContain('朝东平着扔出去');
+    expect(reports[0].text).not.toContain('就在脚边扔的');
+  });
 });
 
 
@@ -4704,7 +4781,7 @@ describe('anvil/grindstone:铁砧与砂轮', () => {
         itemsByName: {},
         entitiesByName: {},
         enchantments: {
-          13: { name: 'sharpness' }, 30: { name: 'infinity' },
+          13: { name: 'sharpness' }, 20: { name: 'fire_aspect' }, 30: { name: 'infinity' },
           31: { name: 'silk_touch' }, 32: { name: 'piercing' },
         },
       },
@@ -4745,6 +4822,8 @@ describe('anvil/grindstone:铁砧与砂轮', () => {
         } else {
           bot.experience.points += opts.xpRefund ?? 0;
         }
+        // shift 取出的产物落进背包段的下一格,窗口账上那一格随之有了它
+        win.slots[win.inventoryStart + bag.length] = win.slots[2];
         bag.push(win.slots[2]!);
         win.slots[0] = null;
         if (opts.station === 'anvil') win.slots[1] = null;
@@ -4826,6 +4905,30 @@ describe('anvil/grindstone:铁砧与砂轮', () => {
       .map((i) => (i.componentMap?.get('stored_enchantments')?.data as
         { enchantments: Array<{ id: number }> }).enchantments[0].id);
     expect(left.sort()).toEqual([31, 32]);
+  });
+
+  it('铁砧:包里还有别的同名件时,回执报的是取出来的那件产物', async () => {
+    const fire = (id: number) => new Map<string, { data?: unknown }>([
+      ['stored_enchantments', { data: { enchantments: [{ id, level: 2 }] } }],
+    ]);
+    const bot = stationBot({
+      station: 'anvil',
+      bag: [
+        { name: 'diamond_sword', count: 1, type: 21, componentMap: sharp3() },
+        { name: 'diamond_sword', count: 1, type: 21 },
+        { name: 'enchanted_book', count: 1, type: 13, componentMap: fire(20) },
+      ],
+      out: {
+        name: 'diamond_sword', count: 1, type: 21,
+        componentMap: new Map([['enchantments', { data: { enchantments: [{ id: 13, level: 3 }, { id: 20, level: 2 }] } }]]),
+      },
+      xpCost: 3,
+    });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'anvil', op: 'combine', item: 'diamond_sword', with: 'enchanted_book' }]);
+    await waitUntil(() => reports.length === 1, 10_000);
+    expect(reports[0].kind).toBe('done');
+    expect(reports[0].text).toContain('附魔 sharpness3、fire_aspect2)');
   });
 
   it('铁砧不认这一对:产出槽没出东西按受阻收场,料退回包里', async () => {

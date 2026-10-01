@@ -11,7 +11,7 @@ import { Vec3 } from 'vec3';
 import type { Logger } from '../../core/types.ts';
 import type { RouteProbe, TargetDiag } from './executor.ts';
 import type { MinecraftLog } from './log.ts';
-import { installMineflayerFixes, installPathfinderToolSelection } from './mineflayer-fixes.ts';
+import { installMineflayerFixes, installOffsetShapes, installPathfinderToolSelection } from './mineflayer-fixes.ts';
 import {
   installPathfinderPerf, setDigBackoff, setNoPlaceCells, setSiteZones, type SiteZone,
 } from './pathfinder-perf.ts';
@@ -21,6 +21,7 @@ import { pocketScan, standCellsAround } from './terrain.ts';
 import { trackWindowProps } from './containers.ts';
 import { installTreadWater } from './travel.ts';
 import { trackMaps } from './map-view.ts';
+import { trackDamageSources } from './damage-source.ts';
 
 interface BridgeOptions {
   host: string;
@@ -43,7 +44,7 @@ interface BridgeOptions {
   blueprintZones?: () => readonly SiteZone[];
   /**
    * 成果登记里的一格(维度已由调用方合上)。寻路器不往登记格自己、也不往它头顶
-   * 垫脚搭路;走与挖不受限。每次候选移动生成时现问。
+   * 垫脚搭路,也不把它排进挖掘计划;走不受限。每次候选移动生成时现问。
    */
   workCell?: (x: number, y: number, z: number) => boolean;
   /** 容器 GUI 演出节拍;摄像机没开/演出关着时回 null(craft 用,每次 bot.craft 现取) */
@@ -329,8 +330,10 @@ export class Bridge {
     this._invSynced = false;
     // 包里地图的整张画面服务端只在登录后第一刻推一次,早于 spawn;挂在 spawn 上就只剩增量
     trackMaps(bot);
+    trackDamageSources(bot);
     /** 修补须通过插件注入，等待 Mineflayer 的 inject_allowed。 */
     bot.loadPlugin((b) => installMineflayerFixes(b, log, this.opts.diag, this.opts.showTempo));
+    bot.loadPlugin(installOffsetShapes);
     bot.loadPlugin(pathfinder);
     installPathfinderPerf(log);
     (bot._client as unknown as { on(ev: string, cb: (pkt: { windowId: number }) => void): void }).on(
@@ -435,6 +438,8 @@ export class Bridge {
 
     // 维度切换只由 transit 发起；普通寻路把传送面与门框当作空间边界。
     const portalBlocks = bot.registry.blocksByName as Record<string, { id: number } | undefined>;
+    /** 传送门方块的 id;寻路器不在这些格子里、也不在它们头顶垫脚(末地传送门头顶垫一块就把门盖住) */
+    const portalIds = new Set<number>();
     for (const name of [
       'nether_portal', 'end_portal', 'end_gateway',
       'obsidian', 'crying_obsidian', 'end_portal_frame',
@@ -443,6 +448,7 @@ export class Bridge {
       if (!portal) continue;
       if (name === 'nether_portal' || name === 'end_portal' || name === 'end_gateway') {
         movements.blocksToAvoid.add(portal.id);
+        portalIds.add(portal.id);
       }
       movements.blocksCantBreak.add(portal.id);
     }
@@ -503,8 +509,12 @@ export class Bridge {
       }
     }
     setSiteZones(movements, this.opts.blueprintZones ?? null);
-    setNoPlaceCells(movements, this.opts.workCell ?? null);
-    setDigBackoff(movements, (x, y, z) => this.digBackedOff(x, y, z));
+    // 判据对落点和落点下面那一格各问一次(见 setNoPlaceCells)
+    const workCell = this.opts.workCell;
+    setNoPlaceCells(movements, (x, y, z) => portalIds.has(bot.blockAt(new Vec3(x, y, z), false)?.type ?? -1)
+      || (workCell?.(x, y, z) ?? false));
+    // 成果登记格同挖不动的格一样排出寻路的挖掘计划;显式挖掘不经这里
+    setDigBackoff(movements, (x, y, z) => this.digBackedOff(x, y, z) || (workCell?.(x, y, z) ?? false));
     const costs = this.opts.movementCosts?.();
     if (costs) {
       movements.placeCost = costs.placeCost;

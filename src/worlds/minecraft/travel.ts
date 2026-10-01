@@ -275,6 +275,8 @@ export interface PathSupportFailure {
   x: number;
   y: number;
   z: number;
+  /** 重试前人眼离那一格已超出手长时的距离;三次发满的失败没有 */
+  leftReach?: number;
 }
 
 export function pathSupportFailureOf(bot: Bot): PathSupportFailure | null {
@@ -403,9 +405,9 @@ export function clearEscapeGoalOwner(bot: Bot): void {
   if (goalOwners.get(bot)?.kind === 'escape') goalOwners.delete(bot);
 }
 
-/** 三条反射自救各自的说法;只出现在所有权账与回报里 */
-export function escapeIntent(kind: 'drown' | 'lava' | 'flee'): string {
-  return kind === 'drown' ? '登岸' : kind === 'lava' ? '逃离岩浆' : '低血脱离';
+/** 反射自救各自的说法;只出现在所有权账与回报里 */
+export function escapeIntent(kind: 'drown' | 'lava' | 'burn' | 'flee'): string {
+  return kind === 'drown' ? '登岸' : kind === 'lava' ? '逃离岩浆' : kind === 'burn' ? '着火找水' : '低血脱离';
 }
 
 /** 松开右键等于发射的那几样:取消归它们自己的持有者(切槽,不放箭) */
@@ -587,7 +589,19 @@ export async function gotoGoalOnce(bot: Bot, goal: InstanceType<typeof goals.Goa
     }
   })();
   try {
-    await bot.pathfinder.goto(goal);
+    for (;;) {
+      try {
+        await bot.pathfinder.goto(goal);
+        break;
+      } catch (err) {
+        // A* 在 thinkTimeout 内没算到目标时,寻路器手里有一段朝目标最好的路且正照着走,
+        // goto 却当场 reject。等这一段走完,从新位置再算下一段;零推进和总时限归上面的看门狗
+        if ((err as Error).name !== 'Timeout') throw err;
+        while (!stalled && !timedOut && !ctx.aborted()
+          && bot.pathfinder.goal === goal && bot.pathfinder.isMoving()) await sleep(200);
+        if (stalled || timedOut || ctx.aborted() || bot.pathfinder.goal !== goal) throw err;
+      }
+    }
   } catch (err) {
     // 中止时目标可能已归抢占方；此处不撤目标，撤销由 abortTask/pump 负责。
     if (ctx.aborted()) throw new Aborted(ctx.abortedBy?.() ?? null);
@@ -595,8 +609,11 @@ export async function gotoGoalOnce(bot: Bot, goal: InstanceType<typeof goals.Goa
     const support = supportBlocked();
     if (support) {
       throw new SkillBlocked(
-        `走不过去:搭路支撑 (${support.x}, ${support.y}, ${support.z}) 放了三次仍是${zhName(support.was)},`
-        + '服务端未确认;已取消这段路径',
+        support.leftReach !== undefined
+          ? `走不过去:搭路支撑 (${support.x}, ${support.y}, ${support.z}) 还没放上,人已经离开它 `
+            + `${support.leftReach} 格(超出手长);已取消这段路径`
+          : `走不过去:搭路支撑 (${support.x}, ${support.y}, ${support.z}) 放了三次仍是${zhName(support.was)},`
+            + '服务端未确认;已取消这段路径',
       );
     }
     if (stalled) throw stallError(stalled);

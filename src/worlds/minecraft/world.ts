@@ -14,6 +14,7 @@ import type {
   EventTag, StoragePart, ToolCallContext, ToolDef, ToolOutcome, TriggerMode,
 } from '../../core/types.ts';
 import { MAP_SIZE, exploredShare, mapStateOf, renderMapPng } from './map-view.ts';
+import { selfDamageText, takeSelfDamage } from './damage-source.ts';
 import { readMapDat } from './level-dat.ts';
 import { readMapId } from './item-facts.ts';
 import { Vec3 } from 'vec3';
@@ -2991,7 +2992,10 @@ export class MinecraftWorld implements World {
   } {
     return {
       state: () => this.client.state(),
-      start: () => this.client.start(),
+      start: () => {
+        this.host?.log.info('观察者客户端由控制台面板启动');
+        return this.client.start();
+      },
       stop: () => this.client.stop(),
     };
   }
@@ -3658,6 +3662,7 @@ export class MinecraftWorld implements World {
       reactCooldownSec: () => this.cfg.reflex.reactCooldownSec,
       antiDrown: () => this.cfg.reflex.antiDrown,
       antiLava: () => this.cfg.reflex.antiLava,
+      currentTask: () => this.executor?.currentTask ?? null,
       combatHurt: (id, name) => (
         this.executor?.onCombatHurt(id, name) || this.combat?.onHurtBy(id, name) || false
       ),
@@ -5511,7 +5516,12 @@ export class MinecraftWorld implements World {
         this.matureAnnounced.clear();
         this.lastDimension = dim;
         this.syncRealm();
-        this.emit('minecraft.event', `[Minecraft] 从${zhDimension(from)}进入了${zhDimension(dim)}。`, true);
+        const cancelled = this.executor?.cancelForDimensionChange(from, dim) ?? null;
+        this.emit(
+          'minecraft.event',
+          `[Minecraft] 从${zhDimension(from)}进入了${zhDimension(dim)}。${cancelled ? `${cancelled}。` : ''}`,
+          true,
+        );
         this.resyncSpectatorForDimension(dim);
       }
       if (dim) this.lastDimension = dim;
@@ -6056,6 +6066,7 @@ export class MinecraftWorld implements World {
           && read(c.x, c.y + 1, c.z) && read(c.x, c.y - 1, c.z)) ?? null;
       },
       clearQueue: () => this.executor!.clear(),
+      dropReflexGoal: (holdMs) => this.reflexes?.abandonEscapeGoal('mc_escape 传送,反射的寻路目标作废', holdMs) ?? null,
       sendConsole: (line) => this.mcServer.command(line),
       chat: (text) => { bot.chat(text); },
       hold: (ms) => { this.escapeHoldUntil = Date.now() + ms; },
@@ -6306,6 +6317,9 @@ export class MinecraftWorld implements World {
   private noticeDamage(health: number): void {
     const prev = this.lastHealth;
     this.lastHealth = health;
+    // 每次血量更新都取走攒下的伤害记录,下一次掉血不会认领这一次的来由
+    const bot = this.bridge?.bot;
+    const hits = bot ? takeSelfDamage(bot) : [];
     if (prev === null || health <= 0 || health >= prev) return;
     const lost = prev - health;
     const now = Date.now();
@@ -6318,8 +6332,9 @@ export class MinecraftWorld implements World {
     const urgent = health < 10 || lost >= URGENT_LOSS;
     if (!urgent && now - this.lastDamageNoticeAt < 6_000) return;
     this.lastDamageNoticeAt = now;
-    const culprit = this.nearestHostile();
-    const from = culprit ? `,${culprit.zh}就在 ${Math.round(culprit.distance)} 格外` : '';
+    // 来由只报服务端 damage_event 给的事实;没收到就不说
+    const source = selfDamageText(hits);
+    const from = source ? `(${source})` : '';
     this.emit(
       'minecraft.event',
       `[Minecraft] 我在掉血!少了 ${Math.round(lost)} 点,现在 ${Math.ceil(health)}/20${from}。`,
@@ -6350,12 +6365,6 @@ export class MinecraftWorld implements World {
       `[Minecraft] 我在掉血:${what},现在 ${Math.ceil(health)}/20。`,
       health < 10,
     );
-  }
-
-  private nearestHostile(): { zh: string; distance: number } | null {
-    const snap = this.snapshot();
-    const hostile = snap?.entities.find((e) => e.kind === 'hostile');
-    return hostile ? { zh: zhEntity(hostile.name), distance: hostile.distance } : null;
   }
 
 

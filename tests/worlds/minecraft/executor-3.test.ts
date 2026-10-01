@@ -103,6 +103,26 @@ describe('显式维度穿越', () => {
     expect(bot.controls).toContainEqual(['jump', true]);
   });
 
+  it('transit 3×3 末地传送门:站在门框上挨着边上那格门就算到了门边,不必站到中心格两格内', async () => {
+    const bot = combatBot({});
+    Object.assign(bot, { game: { dimension: 'overworld' } });
+    // 门方块 (9..11, 64, -1..1),给的是中心格 (10,64,0)
+    bot.blockAt = ((p: V) => (
+      Math.floor(p.y) === 64 && Math.abs(Math.floor(p.x) - 10) <= 1 && Math.abs(Math.floor(p.z)) <= 1
+        ? { name: 'end_portal' }
+        : { name: 'air' }
+    )) as typeof bot.blockAt;
+    let goal: { isEnd(n: { x: number; y: number; z: number }): boolean } | null = null;
+    bot.pathfinder.goto = async (g: FakeGoal) => { goal = g as unknown as typeof goal; throw new Error('no path'); };
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'transit', at: [10, 64, 0] }]);
+    await waitUntil(() => reports.length === 1, 3000);
+
+    // 门框顶上 (8,65,0) 离中心格 √5 格;能算到达,寻路器就不用在门头顶垫块凑近
+    expect(goal!.isEnd({ x: 8, y: 65, z: 0 })).toBe(true);
+    expect(goal!.isEnd({ x: 6, y: 65, z: 0 })).toBe(false);
+  });
+
   it('transit 折跃门:维度不变,按人被挪走的距离判穿过去', async () => {
     const bot = combatBot({});
     Object.assign(bot, { game: { dimension: 'the_end' } });
@@ -175,6 +195,87 @@ describe('显式维度穿越', () => {
     expect(reports[0].kind).toBe('blocked');
     expect(reports[0].text).toContain('这处坐标属于下界,我当前在主世界');
     expect(goto).not.toHaveBeenCalled();
+  });
+
+  it('非 transit 步途中维度变了:旧维度的寻路目标当刻撤掉,当前与排着的单各报取消', async () => {
+    const bot = combatBot({});
+    Object.assign(bot, { game: { dimension: 'overworld' } });
+    let fail: ((e: Error) => void) | null = null;
+    // 寻路器的约定:目标被撤时 goto 以错误结束
+    const pf = {
+      goal: null as unknown,
+      stop() {},
+      setGoal(g: unknown) {
+        pf.goal = g;
+        if (g === null) fail?.(new Error('GoalChanged'));
+      },
+      goto: (goal: FakeGoal) => new Promise<void>((_ok, reject) => { pf.goal = goal; fail = reject; }),
+    };
+    Object.assign(bot, { pathfinder: pf });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'goto', at: [1093, -13, 843] }]);
+    exec.submit([{ skill: 'goto', at: [1093, -13, 843] }]);
+    await waitUntil(() => pf.goal !== null);
+
+    (bot as unknown as { game: { dimension: string } }).game.dimension = 'the_end';
+    const note = exec.cancelForDimensionChange('overworld', 'the_end');
+
+    expect(pf.goal).toBeNull();
+    expect(note).toContain('寻路目标已撤');
+    expect(reports.map((r) => r.kind)).toEqual(['cancelled', 'cancelled']);
+    expect(reports[0].text).toContain('没经 transit 从主世界进入了末地');
+    await sleep(100);
+    // 被撤的那一单收尾时不再补一条终态,排着的也不会在末地开跑
+    expect(reports).toHaveLength(2);
+    expect(exec.status().waiting).toHaveLength(0);
+  });
+
+  it('A* 限时内没算完:照走手里那段路,走完从新位置再算一次(goto 共两次),到了就算做成', async () => {
+    const bot = combatBot({});
+    let calls = 0;
+    let moving = false;
+    const pf = {
+      goal: null as unknown,
+      stop() {},
+      setGoal(g: unknown) { pf.goal = g; },
+      isMoving: () => moving,
+      goto: async (g: unknown) => {
+        pf.goal = g;
+        calls++;
+        if (calls === 1) {
+          // 寻路器拿着最好的那段部分路径在走,goto 却已经以 Timeout reject
+          moving = true;
+          bot.entity.position = new V(5.5, 64, 0.5);
+          setTimeout(() => { bot.entity.position = new V(9.5, 64, 0.5); moving = false; }, 600);
+          throw Object.assign(new Error('Took to long to decide path to goal!'), { name: 'Timeout' });
+        }
+        bot.entity.position = new V(20.5, 64, 0.5);
+      },
+    };
+    Object.assign(bot, { pathfinder: pf });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'goto', at: [20, 64, 0] }]);
+    await waitUntil(() => reports.length === 1, 5000);
+
+    expect(reports[0].kind).toBe('done');
+    expect(calls).toBe(2);
+  });
+
+  it('transit 步途中维度变化是它本来要做的事,不撤单', async () => {
+    const bot = combatBot({ goto: () => new Promise<void>(() => {}) });
+    Object.assign(bot, { game: { dimension: 'overworld' } });
+    bot.blockAt = ((p: V) => (
+      Math.floor(p.x) === 10 && Math.floor(p.y) === 64 && Math.floor(p.z) === 0
+        ? { name: 'end_portal' }
+        : { name: 'air' }
+    )) as typeof bot.blockAt;
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'transit', at: [10, 64, 0] }]);
+    await sleep(10);
+
+    expect(exec.cancelForDimensionChange('overworld', 'the_end')).toBeNull();
+    expect(reports).toHaveLength(0);
+    expect(exec.current).not.toBeNull();
   });
 });
 
@@ -1159,8 +1260,11 @@ describe('战逃与水面', () => {
     land?: boolean;
     roofY?: number;
     goto?: (bot: ReturnType<typeof diveBot>) => Promise<void>;
+    /** 寻路报到达时人还在登岸那一跳的半空,再过这么多 tick 才着地 */
+    landAfterTicks?: number;
   }) {
     const controls: Array<[string, boolean]> = [];
+    let airTicks = 0;
     const startedAt = Date.now();
     const bot = {
       controls,
@@ -1192,12 +1296,16 @@ describe('战逃与水面', () => {
         }
         return y <= 63 ? { name: 'water', boundingBox: 'empty' } : { name: 'air', boundingBox: 'empty' };
       },
+      waitForTicks: async (n: number) => {
+        airTicks += n;
+        if (opts.landAfterTicks !== undefined && airTicks >= opts.landAfterTicks) bot.entity.onGround = true;
+      },
       pathfinder: {
         stop() {},
         setGoal() {},
         goto: async () => {
           await opts.goto?.(bot);
-          bot.entity.onGround = true;
+          if (opts.landAfterTicks === undefined) bot.entity.onGround = true;
         },
       },
     };
@@ -1259,6 +1367,18 @@ describe('战逃与水面', () => {
     expect(reports[0].text).toContain('这里仍有遮盖,没有回到露天');
     expect(reports[0].text).toContain('out_of_liquid=true,standing=true,sky_visible=false,final_y=64');
     expect(reports[0].text).not.toContain('这里能看见天空');
+  });
+
+  // 寻路器在登岸那一跳的半空就报到达;当场读落脚会把已经上岸判成失败
+  it('surface 到达时人还在半空:等着地再判落脚,上岸照实报成功', async () => {
+    const bot = diveBot({ land: true, landAfterTicks: 4, goto: async (b) => { b.entity.position = new V(1.5, 64.4, 0.5); } });
+    bot.entity.position = new V(0.5, 63, 0.5);
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'surface' }]);
+    await waitUntil(() => reports.length === 1, 8000);
+    expect(reports[0].kind).toBe('done');
+    expect(reports[0].text).toContain('我脱离液体并站稳了');
+    expect(reports[0].text).toContain('standing=true');
   });
 
   it('surface 登岸寻路失败:跳键照样在退出前松开', async () => {
@@ -1963,6 +2083,46 @@ describe('Reflexes 摔落', () => {
   });
 
   /**
+   * 半秒落完 12 格:心跳只采到一次「已掉 5.9 格」,下一拍就着地了。落地这一拍按总落差
+   * 补判,撤掉原来那条路,否则人在坑底还沿着旧路走。
+   */
+  it('两次心跳之间就落完的深坠:落地那一拍按总落差叫停任务并撤路', () => {
+    const bot = fallBot();
+    const reports: TaskReport[] = [];
+    const stops: string[] = [];
+    const { exec: environmentExec } = makeExecutorOn(bot);
+    const reflexes = new Reflexes({
+      getBot: () => bot as never,
+      pauseEnvironment: (reason) => environmentExec.pauseForEnvironment(reason),
+      resumeEnvironment: (token) => environmentExec.resumeAfterEnvironment(token),
+      report: (r) => reports.push(r),
+      log,
+      preempt: () => {},
+      stopFallTask: (reason) => { stops.push(reason); return { owner: Symbol('fall') }; },
+      resumeAfterFall: () => false,
+      fightBack: () => false,
+      fleeHealth: () => 10,
+      reactCooldownSec: () => 8,
+      antiDrown: () => false,
+      antiLava: () => false,
+    });
+    bot.pf.setGoal('原来那条路');
+    reflexes.start();
+    vi.advanceTimersByTime(200); // 起跳点 y=80
+    bot.entity.position = new V(0.5, 74.1, 0.5);
+    vi.advanceTimersByTime(200); // 掉了 5.9 格,还没到阈值
+    expect(stops).toEqual([]);
+    bot.entity.position = new V(0.5, 67, 0.5);
+    bot.entity.onGround = true;
+    bot.entity.velocity = { x: 0, y: 0, z: 0 };
+    vi.advanceTimersByTime(200);
+    reflexes.stop();
+    expect(stops).toHaveLength(1);
+    expect(bot.pf.goal).toBeNull();
+    expect(reports.some((r) => r.text.includes('深坠落着地,掉了 13.0 格'))).toBe(true);
+  });
+
+  /**
    * 寻路目标带数值 Y 且位于当前位置下方至少阈值距离时，深坠守卫不撤销该任务。
    */
   it('寻路目标就在下方 ≥6 格:深坠不撤单(抢救豁免)', () => {
@@ -2062,9 +2222,9 @@ describe('Reflexes 摔落', () => {
     vi.advanceTimersByTime(200);
 
     expect(exec.current).toBeNull();
-    expect(reports).toHaveLength(1);
-    expect(reports[0].kind).toBe('cancelled');
+    expect(reports.map((r) => r.kind)).toEqual(['cancelled', 'reflex']);
     expect(reports[0].text).toContain('深坠落超过 6 格');
+    expect(reports[1].text).toContain('排着的计划冻结到稳定落脚');
     expect(bot.pf.goal).toBeNull();
     expect(diag.after(0).filter((e) => e.event === 'falling-stop')).toHaveLength(1);
     expect(bot.controls).toEqual([]);
@@ -2087,7 +2247,7 @@ describe('Reflexes 摔落', () => {
       : { name: 'air', boundingBox: 'empty' }) as typeof bot.blockAt;
     await vi.advanceTimersByTimeAsync(800);
 
-    expect(reports.map((r) => r.kind)).toEqual(['cancelled', 'cancelled', 'done']);
+    expect(reports.map((r) => r.kind)).toEqual(['cancelled', 'reflex', 'cancelled', 'done']);
     const safe = diag.after(0).filter((e) => e.event === 'falling-safe');
     expect(safe).toHaveLength(1);
     // 冻结已经由 mc_stop 解除,反射手里那张令牌落地时对不上号
@@ -2810,13 +2970,20 @@ describe('fish:走到水边钓一竿,收获按物品栏差分照实报', () => {
     loot?: { name: string; type: number };
     /** 抛出去的浮标停在哪(不给就当浮标实体没同步过来) */
     bobberAt?: [number, number, number];
+    /** 实心方块 */
+    solid?: Array<[number, number, number]>;
   }) {
     const inv: Array<{ name: string; count: number; type: number }> = [];
     if (opts.rod !== false) inv.push({ name: 'fishing_rod', count: 1, type: 30 });
     const water = new Set((opts.water ?? []).map(([x, y, z]) => `${x},${y},${z}`));
+    const solid = new Set((opts.solid ?? []).map(([x, y, z]) => `${x},${y},${z}`));
     let reeled = 0;
+    /** 挂着的 fish():收竿后浮标销毁包隔一段网络延迟才到,到了它才以 Fishing cancelled 收场 */
+    let pending: { reject: (e: Error) => void } | null = null;
+    let overlapped = 0;
     const bot = {
       reeledCount: () => reeled,
+      overlapCount: () => overlapped,
       entity: { id: 9, position: new V(0.5, 64, 0.5), onGround: true },
       entities: opts.bobberAt
         ? { 7: { id: 7, name: 'fishing_bobber', position: new V(...opts.bobberAt) } }
@@ -2826,16 +2993,27 @@ describe('fish:走到水边钓一竿,收获按物品栏差分照实报', () => {
       findBlocks: () => (opts.water ?? []).map(([x, y, z]) => new V(x, y, z)),
       canSeeBlock: () => true,
       blockAt: (p: V) => {
-        const name = water.has(`${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`) ? 'water' : 'air';
+        const k = `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;
+        if (solid.has(k)) return { name: 'stone', position: p.floored(), boundingBox: 'block', diggable: true };
+        const name = water.has(k) ? 'water' : 'air';
         return { name, position: p.floored(), boundingBox: 'empty', diggable: true };
       },
       equip: async () => {},
       lookAt: async () => {},
       look: async () => {},
-      activateItem: () => { reeled++; },
-      fish: () => new Promise<void>((resolve) => {
+      activateItem: () => {
+        reeled++;
+        const cast = pending;
+        if (cast) setTimeout(() => cast.reject(new Error('Fishing cancelled')), 30);
+      },
+      fish: () => new Promise<void>((resolve, reject) => {
+        if (pending) overlapped++;
+        const me = { reject: (e: Error) => { if (pending === me) pending = null; reject(e); } };
+        pending = me;
         if (opts.biteAfterMs === undefined) return; // 永不咬钩,等收竿
         setTimeout(() => {
+          if (pending !== me) return;
+          pending = null;
           if (opts.loot) inv.push({ name: opts.loot.name, count: 1, type: opts.loot.type });
           resolve();
         }, opts.biteAfterMs);
@@ -2943,15 +3121,54 @@ describe('fish:走到水边钓一竿,收获按物品栏差分照实报', () => {
   });
 
   it('浮标落在岸上:立刻收竿换仰角重抛,抛满还是不进水就照实受阻', async () => {
-    const bot = fishBot({ water: [[2, 63, 0]], bobberAt: [1.5, 64.2, 0.5] });
+    // 浮标搁在 (1,63,0) 那块石头顶上
+    const bot = fishBot({ water: [[2, 63, 0]], solid: [[1, 63, 0]], bobberAt: [1.5, 64, 0.5] });
     const { exec, reports } = makeExecutorOn(bot);
     exec.submit([{ skill: 'fish' }]);
     await waitUntil(() => reports.length === 1, 15000);
     expect(reports[0].kind).toBe('blocked');
     expect(reports[0].text).toContain('没进水里');
-    expect(reports[0].text).toContain('(1, 64, 0)');
+    expect(reports[0].text).toContain('(1, 63, 0) 的石头上');
     // 三竿三次收竿,不是干等满 45 秒
     expect(bot.reeledCount()).toBe(3);
+    // 每竿收竿后都等挂着的 fish() 收场才抛下一竿
+    expect(bot.overlapCount()).toBe(0);
+  }, 20000);
+
+  // 10/01 17:10–17:44:超时收竿后不等 fish() 收场,下一竿被旧浮标的销毁包取消(0.2s「浮标没了」),
+  // 与 45 秒空等交替出现
+  it('等满时限收竿:等这一竿的 fish() 收场才开下一竿', async () => {
+    const bot = fishBot({ water: [[2, 63, 0]], bobberAt: [2.5, 63.5, 0.5] });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'fish' }, { skill: 'fish' }]);
+    await waitUntil(() => reports.length === 1, 200_000);
+    expect(reports[0].text).not.toContain('浮标没了');
+    expect(reports[0].text.match(/等了 45 秒没鱼咬钩/g)?.length).toBe(2);
+    expect(bot.overlapCount()).toBe(0);
+  }, 20000);
+
+  // 原版浮标漂在水面时会冒到水面格上一格;10/01 有 33 竿这样被判成「落在空气上」
+  it('浮标漂在水面格上一格:算进水,照常等咬钩', async () => {
+    const bot = fishBot({ water: [[2, 63, 0]], bobberAt: [2.5, 64.05, 0.5], biteAfterMs: 3000, loot: { name: 'cod', type: 21 } });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'fish' }]);
+    await waitUntil(() => reports.length === 1, 15000);
+    expect(reports[0].kind).toBe('done');
+    expect(reports[0].text).toContain('钓上来生鳕鱼×1');
+    expect(bot.reeledCount()).toBe(0);
+  }, 20000);
+
+  // 飞行中/没同步到的读数悬在空中;10/01 有 44 竿在水面上 2–4 格被判成「落在空气上」
+  it('浮标读数悬在空中:不当落点,等它真落进水', async () => {
+    const bot = fishBot({ water: [[2, 63, 0]], bobberAt: [1.5, 66.2, 0.5], biteAfterMs: 4000, loot: { name: 'cod', type: 21 } });
+    const bobber = bot.entities[7]!;
+    setTimeout(() => { bobber.position = new V(2.5, 63.5, 0.5); }, 2500);
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'fish' }]);
+    await waitUntil(() => reports.length === 1, 15000);
+    expect(reports[0].kind).toBe('done');
+    expect(reports[0].text).toContain('钓上来生鳕鱼×1');
+    expect(bot.reeledCount()).toBe(0);
   }, 20000);
 });
 
@@ -3477,6 +3694,8 @@ describe('find 的行军代价上受理刻', () => {
 
 
 describe('Reflexes 防溺水:换气点、登岸通路与计时兜底', () => {
+  /** 触发那一句;反射接管寻路的去向与溺水结束另有报告 */
+  const alarms = (rs: TaskReport[]): TaskReport[] => rs.filter((r) => !r.text.includes('溺水自救'));
   /** 三维格子图的假 bot:`world` 给每格方块名;人在 (0,61,0),头在 y62 */
   function waterBot(world: (x: number, y: number, z: number) => string, oxygenLevel: number) {
     const goals: Array<{ x: number; y: number; z: number } | null> = [];
@@ -3587,17 +3806,32 @@ describe('Reflexes 防溺水:换气点、登岸通路与计时兜底', () => {
     expect(again).toBe(false);
   });
 
+  /** 登岸目标按传送前的位置算,mc_escape 传送前不撤,落地后寻路器会把人拽回原落水处。 */
+  it('传送前撤掉登岸寻路目标:寻路器目标清空,返回撤了什么', () => {
+    const bot = waterBot(pocket, 3);
+    const { reflexes, reports } = reflexesOn(bot);
+    reflexes.start();
+    vi.advanceTimersByTime(2_600);
+    expect(setGoals(bot)).toHaveLength(1);
+    expect(reports.some((r) => r.text.includes('反射接管寻路'))).toBe(true);
+    const text = reflexes.abandonEscapeGoal('mc_escape 传送', 3_500);
+    expect(bot.goals[bot.goals.length - 1]).toBeNull();
+    expect(text).toContain('登岸寻路');
+    expect(text).toContain('(0, 62, 1)');
+    reflexes.stop();
+  });
+
   it('氧气读数一直不跌:头在水下满 10 秒按计时兜底触发', () => {
     const bot = waterBot(pocket, 20);
     const { reflexes, reports, events } = reflexesOn(bot);
     reflexes.start();
     vi.advanceTimersByTime(9_000);
-    expect(reports).toHaveLength(0);
+    expect(alarms(reports)).toHaveLength(0);
     vi.advanceTimersByTime(2_000);
     reflexes.stop();
-    expect(reports).toHaveLength(1);
-    expect(reports[0].text).toContain('头在水下已 10 秒');
-    expect(reports[0].text).toContain('氧气读数 20/20');
+    expect(alarms(reports)).toHaveLength(1);
+    expect(alarms(reports)[0].text).toContain('头在水下已 10 秒');
+    expect(alarms(reports)[0].text).toContain('氧气读数 20/20');
     expect(events()).toContain('drown-trigger');
   });
 
@@ -3609,13 +3843,13 @@ describe('Reflexes 防溺水:换气点、登岸通路与计时兜底', () => {
       bot.oxygenLevel = oxygen;
       vi.advanceTimersByTime(2_000);
     }
-    expect(reports).toHaveLength(0);
+    expect(alarms(reports)).toHaveLength(0);
     bot.oxygenLevel = 7;
     vi.advanceTimersByTime(1_000);
     reflexes.stop();
-    expect(reports).toHaveLength(1);
-    expect(reports[0].text).toContain('氧气读数 7/20');
-    expect(reports[0].text).not.toContain('没跌');
+    expect(alarms(reports)).toHaveLength(1);
+    expect(alarms(reports)[0].text).toContain('氧气读数 7/20');
+    expect(alarms(reports)[0].text).not.toContain('没跌');
     const trigger = diag.after(0).find((r) => r.event === 'drown-trigger');
     expect(trigger?.data).toMatchObject({ oxygen: 7, oxygenTrusted: true, byTimer: true });
     expect(trigger?.msg).not.toContain('没跌');
@@ -3641,11 +3875,11 @@ describe('Reflexes 防溺水:换气点、登岸通路与计时兜底', () => {
     vi.advanceTimersByTime(200);
     (reflexes as unknown as { deathHandler: () => void }).deathHandler();
     vi.advanceTimersByTime(6_000);
-    expect(reports).toHaveLength(0);
+    expect(alarms(reports)).toHaveLength(0);
     vi.advanceTimersByTime(5_000);
     reflexes.stop();
-    expect(reports).toHaveLength(1);
-    expect(reports[0].text).toContain('氧气读数复活后没刷新');
+    expect(alarms(reports)).toHaveLength(1);
+    expect(alarms(reports)[0].text).toContain('氧气读数复活后没刷新');
   });
 
   it('读数复活后变了一次就重新可信:又按氧气触发', () => {
@@ -3657,8 +3891,8 @@ describe('Reflexes 防溺水:换气点、登岸通路与计时兜底', () => {
     bot.oxygenLevel = 5;
     vi.advanceTimersByTime(2_600);
     reflexes.stop();
-    expect(reports).toHaveLength(1);
-    expect(reports[0].text).toContain('氧气 5/20');
+    expect(alarms(reports)).toHaveLength(1);
+    expect(alarms(reports)[0].text).toContain('氧气 5/20');
   });
 });
 
@@ -3772,6 +4006,17 @@ describe('fish:开阔水域优先、视线放宽、包满与遮蔽的回执', ()
     // 完全看不见、也不在 3 格内的另一片水不入席
     const far = lakeBot({ lake: { x0: 5, x1: 12, z0: -6, z1: 6, depth: 3 }, canSee: () => false });
     expect(findFishingSpot(far as never, 12)).toBeNull();
+  });
+
+  // 10/01 14:56、22:46 在家里箱子旁:5 格外就有水面,被平台边的墙挡住,回执只说「没看见」
+  it('水面都被挡着:回执点出最近那格水面在哪', async () => {
+    const bot = lakeBot({ lake: { x0: 5, x1: 12, z0: -6, z1: 6, depth: 3 }, canSee: () => false });
+    const { exec, reports } = makeExecutorOn(bot);
+    exec.submit([{ skill: 'fish' }]);
+    await waitUntil(() => reports.length === 1, 8000);
+    expect(reports[0].kind).toBe('blocked');
+    expect(reports[0].text).toContain('没看见能下竿的水面');
+    expect(reports[0].text).toContain('(5, 63, 0) 有水面');
   });
 
   it('小池钓成:回执带「这片水没有开阔水域」,站在原地抛得到就不走过去', async () => {
