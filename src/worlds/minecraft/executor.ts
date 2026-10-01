@@ -171,7 +171,7 @@ import {
   slotStack, smeltPerItemMs, stationItemFacts, type GenericWindow,
 } from './containers.ts';
 import {
-  consumeHeldFood, craftItemDef, craftNeeds, equipNamed, skillCraft, skillEat, skillEquip,
+  consumeHeldFood, craftItemDef, craftNeeds, equipNamed, skillCraft, skillEat, skillEquip, smithingInputs,
   type CraftRecipeLike,
 } from './skills-craft.ts';
 import { isKnownTarget, unknownUseTargetText } from './entity-facts.ts';
@@ -369,6 +369,8 @@ function collectDropName(bot: Bot, block: string): string | null {
 function craftInputNames(bot: Bot, item: string): string[] {
   const def = craftItemDef(bot, item);
   if (!def) return [];
+  const smithing = smithingInputs(def.name);
+  if (smithing) return smithing;
   const items = bot.registry.items as unknown as Record<number, { name: string } | undefined>;
   const all = bot.recipesAll(def.id, null, true as never) as unknown as CraftRecipeLike[];
   const names = new Set<string>();

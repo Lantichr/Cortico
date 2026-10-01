@@ -114,6 +114,7 @@ const WHOLE: Record<string, string> = {
   glass_bottle: '玻璃瓶', potion: '药水', splash_potion: '喷溅药水',
   lingering_potion: '滞留药水', tipped_arrow: '药箭', dragon_breath: '龙息',
   magma_cream: '岩浆膏', fermented_spider_eye: '发酵蜘蛛眼', netherite_scrap: '下界合金碎片',
+  netherite_upgrade_smithing_template: '下界合金升级锻造模板',
   rabbit_foot: '兔子脚', rabbit_hide: '兔子皮', shulker_shell: '潜影壳',
   enchanted_book: '附魔书', written_book: '成书', writable_book: '书与笔', filled_map: '地图',
   dried_kelp: '干海带', dried_kelp_block: '干海带块', beetroot_soup: '甜菜汤',

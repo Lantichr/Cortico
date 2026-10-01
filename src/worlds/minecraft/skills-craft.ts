@@ -13,7 +13,10 @@ import {
   invVariantGains, invVariantSnapshot,
   namedLike, noSuchItem,
 } from './inventory.ts';
-import { CRAFTING_STATION, ensureStation } from './placement.ts';
+import { CRAFTING_STATION, ensureStation, type Station } from './placement.ts';
+import {
+  WINDOW_SETTLE_MS, openStationWindow, putIntoStation, stationItemFacts,
+} from './containers.ts';
 import { HANDHELD_SUFFIXES, equipDestOf, equippedAlready } from './tools.ts';
 import { DRINKABLES } from './item-facts.ts';
 import { noteAte } from './placed-ledger.ts';
@@ -102,6 +105,8 @@ export async function skillCraft(
     if (!def) throw new SkillBlocked(`不认识「${call.item}」这种物品`);
     targetId = def.id;
     label = zhName(def.name);
+    const smithing = smithingInputs(def.name);
+    if (smithing) return smithNetherite(bot, def.name, smithing, call.count, ctx);
     // 配方表里同一样东西可能有好几种摆法(木棍:竹子/木板)。挑手上材料齐的那一种;
     // 都不齐就把配方要的直接材料照实说出来 —— 不再往下递归找"材料的材料"。
     const all = bot.recipesAll(def.id, null, true as never) as unknown as CraftRecipeLike[];
@@ -206,6 +211,85 @@ export async function skillCraft(
   const held = targetId !== null ? await equipIfHandheld(bot, nameOfId(bot, targetId)) : false;
   return `${made.length > 0 ? `${made.join('、')};` : ''}合成出来:${gains.join('、')}` +
     (targetId !== null && targetGain < call.count ? `(要 ${call.count} 个,只多出 ${targetGain} 个)${late}` : '') +
+    (held ? ',已经拿在手上' : '');
+}
+
+/** 原版锻造台的升级配方只有下界合金这一族:钻石件 + 下界合金锭 + 下界合金升级模板 */
+const NETHERITE_UPGRADES = [
+  'sword', 'axe', 'pickaxe', 'shovel', 'hoe', 'helmet', 'chestplate', 'leggings', 'boots',
+];
+const NETHERITE_TEMPLATE = 'netherite_upgrade_smithing_template';
+const NETHERITE_INGOT = 'netherite_ingot';
+
+export const SMITHING_STATION: Station = {
+  kinds: ['smithing_table'], label: '锻造台', hint: '先 craft 一个锻造台(2 个铁锭 + 4 块木板)',
+};
+/** 1.20 起锻造台的槽位:模板 0、底料 1、添料 2、产出 3 */
+const SMITH_SLOTS = { template: 0, base: 1, addition: 2, result: 3 } as const;
+
+/** netherite_X 在锻造台上的三样材料(模板、底料 diamond_X、锭);不是锻造升级产物时返回 null */
+export function smithingInputs(item: string): string[] | null {
+  const kind = item.startsWith('netherite_') ? item.slice('netherite_'.length) : '';
+  return NETHERITE_UPGRADES.includes(kind) ? [NETHERITE_TEMPLATE, `diamond_${kind}`, NETHERITE_INGOT] : null;
+}
+
+/**
+ * 下界合金装备不在合成配方表里,要在锻造台上升级钻石件。每件消耗模板、钻石件、锭各一个,
+ * 钻石件的附魔与耐久跟到产物上。产量按包里净增算。
+ */
+async function smithNetherite(
+  bot: Bot, item: string, parts: string[], count: number, ctx: SkillContext,
+): Promise<string> {
+  const label = zhName(item);
+  const [template, base, ingot] = parts;
+  const have = parts.map((name) => ({ name, n: invCount(bot, (x) => x === name) }));
+  const short = have.filter((h) => h.n < count);
+  if (short.length > 0) {
+    const bag = have.map((h) => `${zhName(h.name)} ${h.n} 个`).join('、');
+    const stock = invCount(bot, (x) => x === item);
+    if (stock >= count) {
+      return `没现做${label}:锻造台升级要的材料不齐(包里${bag});不过包里本来就有 ${stock} 个,够这一步要的 ${count} 个了`;
+    }
+    throw new SkillBlocked(
+      `${label}要在锻造台上升级:${parts.map((p) => zhName(p)).join(' + ')} 各 1 个出 1 件,` +
+        `做 ${count} 件各要 ${count} 个;包里${bag}`,
+    );
+  }
+  const station = await ensureStation(bot, SMITHING_STATION, ctx);
+  const cell = { x: station.x, y: station.y, z: station.z };
+  const before = invCount(bot, (x) => x === item);
+  const { win } = await openStationWindow(bot, ctx, cell, SMITHING_STATION.kinds, SMITHING_STATION.label);
+  let done = 0;
+  try {
+    for (let n = 0; n < count; n++) {
+      checkAbort(ctx);
+      await putIntoStation(bot, win, (x) => x === template, SMITH_SLOTS.template, zhName(template));
+      await putIntoStation(bot, win, (x) => x === base, SMITH_SLOTS.base, zhName(base));
+      await putIntoStation(bot, win, (x) => x === ingot, SMITH_SLOTS.addition, zhName(ingot));
+      await sleep(WINDOW_SETTLE_MS);
+      if (!win.slots[SMITH_SLOTS.result]) {
+        throw new SkillBlocked(
+          `${station.note};锻造台的产出槽没出东西:${parts.map((p) => zhName(p)).join(' + ')} 都放进去了` +
+            (done > 0 ? `(之前已升级 ${done} 件)` : ''),
+          [], 'server',
+        );
+      }
+      await (bot as unknown as { clickWindow(s: number, b: number, m: number): Promise<void> })
+        .clickWindow(SMITH_SLOTS.result, 0, 1);
+      await sleep(WINDOW_SETTLE_MS);
+      done += 1;
+    }
+  } finally {
+    try { bot.closeWindow(win as never); } catch { /* 已关 */ }
+  }
+  const gained = invCount(bot, (x) => x === item) - before;
+  if (gained <= 0) {
+    throw new SkillBlocked(`${station.note};在锻造台上升级了 ${done} 次,包里${label}一个都没多`, [], 'server');
+  }
+  const result = bot.inventory.items().find((i) => i.name === item) ?? null;
+  const held = await equipIfHandheld(bot, item);
+  return `${station.note};在锻造台上升级出 ${gained} 件${label}(${stationItemFacts(bot, result)})` +
+    (gained < count ? `(要 ${count} 件,只多出 ${gained} 件)` : '') +
     (held ? ',已经拿在手上' : '');
 }
 

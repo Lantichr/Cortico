@@ -1276,7 +1276,9 @@ const SKILLS: readonly SkillSpec[] = [
                                                  2 行 2 列以内徒手就能做,更大要工作台。产出槽出什么算什么。
 {"skill":"craft","item":"wooden_pickaxe","count":1}
                                                  也可以只写 item,按游戏自带的配方表摆。**中间材料不会自动补**。
-                                                 够得着的工作台直接用;够不着就放一个自己带的,包里没有才走去现成的`,
+                                                 够得着的工作台直接用;够不着就放一个自己带的,包里没有才走去现成的。
+                                                 下界合金装备(netherite_sword 等)走锻造台:每件要下界合金升级模板、
+                                                 同种钻石件、下界合金锭各 1 个,钻石件的附魔与耐久跟到产物上`,
     parse: parseCraft,
     fields: [
       { key: 'item', kind: 'string', doc: '按游戏配方表摆;与 grid 二选一' },
